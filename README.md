@@ -24,7 +24,7 @@
 
 ## 🎯 À Propos du Projet
 
-**Stealth-Scraper** est un script Python autonome orienté CLI (Interface en Ligne de Commande) combinant la puissance de `yt-dlp`, `gallery-dl` et un moteur de téléchargement segmenté personnalisé sous `aiohttp`. 
+**NSFW SCRAPER** est un script Python autonome orienté CLI (Interface en Ligne de Commande) combinant la puissance de `yt-dlp`, `gallery-dl` et un moteur de téléchargement segmenté personnalisé sous `aiohttp`. 
 
 Pensé pour les environnements hautes performances (comme les configurations SSD/NVMe sur macOS/Linux), il intègre des mécanismes stricts de contournement de Cloudflare, un système de reprise après incident (Resume) via SQLite, et une vérification d'intégrité vidéo en temps réel via `ffprobe`.
 
