@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Stealth-Scraper CLI Autonome (Édition Parfaite)
-- Extraction asynchrone avec Spinner visuel (Anti-Freeze).
-- Injection de User-Agents furtifs dans Gallery-DL.
-- Auto-Mise à jour des extracteurs pour contrer Cloudflare.
-- Affichage détaillé du type de médias rétabli.
+NSFW-Scraper - Modular media scraper for NSFW content.
+Features:
+- Interactive CLI with site selection.
+- Segmented async downloads with retry logic.
+- SQLite database for tracking downloads.
+- Automatic dependency installation.
+- Multi-OS support (Windows, Linux, macOS).
+
+Usage:
+    python main.py
 """
 
 import os
@@ -15,131 +20,197 @@ import hashlib
 import logging
 import random
 import subprocess
-from datetime import datetime
+import shutil
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-# ====================== CONFIGURATION & DÉPENDANCES ======================
-REQUIRED_PACKAGES = [
-    "aiohttp",
-    "aiofiles",
-    "aiosqlite",
-    "yt-dlp",
-    "gallery-dl",
-    "tqdm",
-]
+# Import global config
+from config import *
 
+# ====================== COLORS ======================
+# ANSI color codes for terminal output
 class Colors:
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    CYAN = "\033[96m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
+    RED = "\033[91m"     # Error messages
+    GREEN = "\033[92m"   # Success messages
+    YELLOW = "\033[93m"  # Warnings
+    CYAN = "\033[96m"    # Info messages
+    BOLD = "\033[1m"     # Bold text
+    RESET = "\033[0m"    # Reset to default
 
-def setup_environment():
-    """Vérifie les dépendances et force la MAJ des extracteurs critiques."""
-    missing = []
-    for pkg in REQUIRED_PACKAGES:
-        try:
-            __import__(pkg.replace("-", "_"))
-        except ImportError:
-            missing.append(pkg)
-            
-    if missing:
-        print(f"[\033[94mACTION\033[0m] Installation : {', '.join(missing)}...")
-        subprocess.call([sys.executable, "-m", "pip", "install", "-U", "--break-system-packages"] + missing, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    # Force l'update des extracteurs en arrière-plan (très rapide) pour contrer les patchs Bunkr
-    subprocess.Popen([sys.executable, "-m", "pip", "install", "-U", "gallery-dl", "yt-dlp", "--break-system-packages"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-    try:
-        subprocess.check_call(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        print(f"[{Colors.CYAN}ACTION{Colors.RESET}] FFmpeg manquant. Installation automatique via Homebrew...")
-        try:
-            subprocess.check_call(["brew", "install", "ffmpeg"])
-        except Exception:
-            print(f"[{Colors.RED}ERREUR{Colors.RESET}] Échec de l'installation de FFmpeg. Tapez 'brew install ffmpeg' manuellement.")
+# ====================== MODULES ======================
+# Available modules (loaded dynamically)
+# Add new modules here (key = module name, value = None initially)
+MODULES = {
+    "bunkr": None,      # Bunkr albums
+    "ph": None,         # PornHub
+    "xvideos": None,    # Xvideos
+    "xhamster": None,   # XHamster
+    "spankbang": None,  # SpankBang
+}
 
-setup_environment()
-
-import aiohttp
-import aiofiles
-import aiosqlite
-from tqdm.asyncio import tqdm
-
-# ====================== ARBORESCENCE & CONSTANTES ======================
-SCRIPT_DIR = Path(__file__).parent.resolve()
-CONFIG_FILE = SCRIPT_DIR / "config.json"
-BASE_DIR = SCRIPT_DIR / "scrap"
-DOWNLOADS_DIR = BASE_DIR / "downloads"
-LOGS_DIR = BASE_DIR / "logs"
-DB_DIR = BASE_DIR / "database"
-LOG_FILE = LOGS_DIR / "scrap_system.log"
-DB_FILE = DB_DIR / "scrap_resume.sqlite"
-
-VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts"}
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0"
-]
-
-def get_random_headers(url: str, start: int, end: int) -> dict:
-    spoofed_ip = f"192.168.{random.randint(1, 254)}.{random.randint(1, 254)}"
-    return {
-        "Referer": url,
-        "User-Agent": random.choice(USER_AGENTS),
-        "Range": f"bytes={start}-{end}",
-        "X-Forwarded-For": spoofed_ip,
-        "X-Real-IP": spoofed_ip,
-        "Accept-Encoding": "identity"
-    }
-
-# ====================== INITIALISATION ======================
-
-def init_directories():
+# ====================== INITIALIZATION ======================
+def init_directories() -> None:
+    """
+    Create necessary directories if they don't exist.
+    Also checks write permissions.
+    """
     for d in [BASE_DIR, DOWNLOADS_DIR, LOGS_DIR, DB_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            # Test write permissions
+            test_file = d / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+        except PermissionError:
+            print(f"{Colors.RED}❌ Permission denied for {d}. Check directory permissions.{Colors.RESET}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"{Colors.RED}❌ Error creating {d}: {e}{Colors.RESET}")
+            sys.exit(1)
 
-def setup_logger():
+def setup_logger() -> logging.Logger:
+    """
+    Configure the logger for the scraper.
+    Logs are saved to scrap/logs/scrap_system.log.
+    """
     init_directories()
     logger = logging.getLogger("ScraperLogger")
     logger.setLevel(logging.DEBUG)
+
+    # Avoid duplicate handlers
     if not logger.handlers:
-        fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s'))
-        logger.addHandler(fh)
+        try:
+            fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s'))
+            logger.addHandler(fh)
+        except Exception as e:
+            print(f"{Colors.RED}❌ Failed to set up logger: {e}{Colors.RESET}")
+
     return logger
 
+# Initialize logger
 LOGGER = setup_logger()
 
-async def init_database():
+# ====================== DATABASE ======================
+async def init_database() -> None:
+    """
+    Initialize SQLite database for tracking downloads.
+    Creates the 'medias' table if it doesn't exist.
+    """
     init_directories()
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS medias (
-                media_id TEXT PRIMARY KEY,
-                album_url TEXT,
-                media_url TEXT,
-                filename TEXT,
-                media_type TEXT,
-                status TEXT,
-                target_path TEXT
-            )
-        """)
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS medias (
+                    media_id TEXT PRIMARY KEY,
+                    album_url TEXT,
+                    media_url TEXT,
+                    filename TEXT,
+                    media_type TEXT,
+                    status TEXT,
+                    target_path TEXT,
+                    module TEXT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.commit()
+    except Exception as e:
+        LOGGER.error(f"Database initialization failed: {e}")
+        print(f"{Colors.RED}❌ Database error: {e}{Colors.RESET}")
 
+async def update_media_status(media_id: str, status: str) -> None:
+    """
+    Update the status of a media in the database.
+    Args:
+        media_id: Unique ID of the media.
+        status: New status (PENDING, DOWNLOADING, COMPLETED, FAILED).
+    """
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "UPDATE medias SET status = ? WHERE media_id = ?",
+                (status, media_id)
+            )
+            await db.commit()
+    except Exception as e:
+        LOGGER.error(f"Failed to update media status: {e}")
+
+async def is_media_already_completed(media_id: str) -> bool:
+    """
+    Check if a media is already downloaded and valid.
+    Args:
+        media_id: Unique ID of the media.
+    Returns:
+        True if media is already completed and file exists, False otherwise.
+    """
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute(
+                "SELECT status, target_path FROM medias WHERE media_id = ?",
+                (media_id,)
+            )
+            row = await cursor.fetchone()
+            if row and row[0] == "COMPLETED" and Path(row[1]).exists():
+                return True
+    except Exception as e:
+        LOGGER.error(f"Error checking media status: {e}")
+    return False
+
+async def register_media(media: Dict) -> bool:
+    """
+    Register a media in the database.
+    Args:
+        media: Dictionary containing media info (must have media_id, status, target_path).
+    Returns:
+        True if media was registered, False if already exists and is completed.
+    """
+    try:
+        if await is_media_already_completed(media["media_id"]):
+            return False
+
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO medias
+                (media_id, album_url, media_url, filename, media_type, status, target_path, module)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    media["media_id"],
+                    media["album_url"],
+                    media["media_url"],
+                    media["filename"],
+                    media["type"],
+                    media["status"],
+                    media["target_path"],
+                    media["module"],
+                )
+            )
+            await db.commit()
+            return True
+    except Exception as e:
+        LOGGER.error(f"Failed to register media: {e}")
+        return False
+
+# ====================== UTILITIES ======================
 def generate_hash(text: str) -> str:
+    """
+    Generate a unique hash for a media URL.
+    Args:
+        text: Input string (usually a URL).
+    Returns:
+        12-character MD5 hash.
+    """
     return hashlib.md5(text.encode()).hexdigest()[:12]
 
 def classify_media(url: str) -> str:
+    """
+    Classify a media URL as video, image, or file.
+    Args:
+        url: Media URL.
+    Returns:
+        "video", "image", or "file".
+    """
     url_lower = url.lower()
     if any(ext in url_lower for ext in VIDEO_EXTS) or "stream" in url_lower or "/v/" in url_lower:
         return "video"
@@ -147,64 +218,193 @@ def classify_media(url: str) -> str:
         return "image"
     return "file"
 
-def clean_console():
+def clean_console() -> None:
+    """Clear the console (cross-platform)."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
-# ====================== INTÉGRITÉ & YT-DLP ======================
+def cleanup_temp_files() -> None:
+    """
+    Clean up temporary files (.part*) from previous downloads.
+    Called at startup and after errors.
+    """
+    for part_file in DOWNLOADS_DIR.glob("**/*.part*"):
+        try:
+            part_file.unlink()
+            LOGGER.info(f"Cleaned up temp file: {part_file}")
+        except Exception as e:
+            LOGGER.error(f"Failed to clean up {part_file}: {e}")
 
-async def verify_video_integrity(file_path: Path) -> bool:
-    if file_path.suffix.lower() not in VIDEO_EXTS:
-        return True 
+# ====================== AUTO-SETUP ======================
+def check_command_exists(command: str) -> bool:
+    """
+    Check if a command exists in the system PATH.
+    Args:
+        command: Command to check (e.g., "ffmpeg").
+    Returns:
+        True if command exists, False otherwise.
+    """
+    return shutil.which(command) is not None
+
+async def install_package(package: str) -> bool:
+    """
+    Install a Python package using pip (async).
+    Args:
+        package: Package name (e.g., "aiohttp").
+    Returns:
+        True if installation succeeded, False otherwise.
+    """
     try:
-        cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0", 
-            "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", str(file_path)
-        ]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = await proc.communicate()
-        return "video" in stdout.decode().strip().lower()
-    except Exception:
-        return True
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "-U", "--break-system-packages", package,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=120)
+        return proc.returncode == 0
+    except Exception as e:
+        LOGGER.error(f"Failed to install {package}: {e}")
+        return False
 
-async def download_ytdlp_native(url: str, platform: str):
-    target_dir = DOWNLOADS_DIR / platform
-    target_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n{Colors.CYAN}🚀 Lancement yt-dlp pour {platform}...{Colors.RESET}")
-    
-    cmd = [
-        "yt-dlp", "--no-check-certificate", "-f", "bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4", "-o", f"{target_dir}/%(title)s [%(id)s].%(ext)s",
-        "--console-title", url
-    ]
-    proc = await asyncio.create_subprocess_exec(*cmd)
-    await proc.communicate()
-    
-    if proc.returncode == 0:
-        print(f"\n{Colors.GREEN}✅ Téléchargement terminé !{Colors.RESET}")
+async def install_ffmpeg() -> bool:
+    """
+    Install ffmpeg based on the OS (async).
+    Returns:
+        True if installation succeeded, False otherwise.
+    """
+    os_type = sys.platform
+    commands = {
+        "darwin": ["brew", "install", "ffmpeg"],
+        "linux": ["sudo", "apt-get", "install", "-y", "ffmpeg"],
+        "win32": ["powershell", "-Command", "winget install -e --id Gyan.FFmpeg"],
+    }
+
+    if os_type not in commands:
+        print(f"{Colors.YELLOW}⚠️  Unsupported OS for automatic ffmpeg installation: {os_type}{Colors.RESET}")
+        return False
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *commands[os_type],
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=120)
+        return proc.returncode == 0
+    except Exception as e:
+        LOGGER.error(f"Failed to install ffmpeg: {e}")
+        return False
+
+async def setup_environment() -> None:
+    """
+    Check and install required dependencies.
+    - Python packages (via pip)
+    - ffmpeg (via brew/apt/winget)
+    - Creates directories
+    - Cleans up temp files
+    """
+    print(f"\n{Colors.CYAN}🔧 Checking dependencies...{Colors.RESET}")
+
+    # Check Python packages
+    missing_packages = []
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            __import__(pkg.replace("-", "_"))
+        except ImportError:
+            missing_packages.append(pkg)
+
+    if missing_packages:
+        print(f"{Colors.YELLOW}⚠️  Missing packages: {', '.join(missing_packages)}{Colors.RESET}")
+        print(f"{Colors.CYAN}📦 Installing missing packages...{Colors.RESET}")
+
+        # Install packages in parallel
+        tasks = [install_package(pkg) for pkg in missing_packages]
+        results = await asyncio.gather(*tasks)
+
+        if not all(results):
+            print(f"{Colors.RED}❌ Some packages failed to install. Check logs for details.{Colors.RESET}")
+
+    # Check ffmpeg
+    if not check_command_exists("ffmpeg"):
+        print(f"{Colors.YELLOW}⚠️  ffmpeg not found. Installing...{Colors.RESET}")
+        if not await install_ffmpeg():
+            print(f"{Colors.RED}❌ Failed to install ffmpeg automatically.{Colors.RESET}")
+            print(f"{Colors.YELLOW}💡 Please install ffmpeg manually:{Colors.RESET}")
+            if sys.platform == "darwin":
+                print("   brew install ffmpeg")
+            elif sys.platform == "linux":
+                print("   sudo apt-get install ffmpeg")
+            elif sys.platform == "win32":
+                print("   winget install -e --id Gyan.FFmpeg")
     else:
-        print(f"\n{Colors.RED}❌ Erreur yt-dlp.{Colors.RESET}")
+        print(f"{Colors.GREEN}✅ ffmpeg is installed.{Colors.RESET}")
 
-# ====================== MOTEUR CRUISE CONTROL (FURTIF CONSTANT) ======================
+    # Clean up temp files
+    cleanup_temp_files()
 
-async def update_media_status(media_id: str, status: str):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE medias SET status = ? WHERE media_id = ?", (status, media_id))
-        await db.commit()
-
-async def get_file_size(url: str, session: aiohttp.ClientSession) -> int:
-    headers = {"Referer": url, "User-Agent": random.choice(USER_AGENTS), "Range": "bytes=0-0"}
+# ====================== DOWNLOAD LOGIC ======================
+async def get_file_size(url: str, session) -> int:
+    """
+    Get the size of a file via HEAD request.
+    Args:
+        url: URL of the file.
+        session: aiohttp ClientSession.
+    Returns:
+        File size in bytes, or 0 if failed.
+    """
+    headers = {
+        "Referer": url,
+        "User-Agent": random.choice(USER_AGENTS),
+        "Range": "bytes=0-0"
+    }
     try:
-        async with session.get(url, headers=headers, timeout=15) as resp:
+        async with session.head(url, headers=headers, timeout=15) as resp:
             if resp.status == 206:
-                cr = resp.headers.get("Content-Range", "")
-                if "/" in cr: return int(cr.split("/")[1])
+                content_range = resp.headers.get("Content-Range", "")
+                if "/" in content_range:
+                    return int(content_range.split("/")[1])
             elif resp.status == 200:
                 return int(resp.headers.get("Content-Length", 0))
-    except Exception:
-        pass
+    except Exception as e:
+        LOGGER.error(f"Failed to get file size for {url}: {e}")
     return 0
 
-async def stealth_worker(queue: asyncio.Queue, session: aiohttp.ClientSession, url: str, pbar: tqdm):
+def get_random_headers(url: str, start: int, end: int) -> Dict[str, str]:
+    """
+    Generate random headers to avoid bot detection.
+    Args:
+        url: URL of the file.
+        start: Start byte for Range header.
+        end: End byte for Range header.
+    Returns:
+        Dictionary of headers.
+    """
+    spoofed_ip = f"192.168.{random.randint(1, 254)}.{random.randint(1, 254)}"
+    return {
+        "Referer": url,
+        "User-Agent": random.choice(USER_AGENTS),
+        "Range": f"bytes={start}-{end}",
+        "X-Forwarded-For": spoofed_ip,
+        "X-Real-IP": spoofed_ip,
+        "Accept-Encoding": "identity",  # Avoid compression
+        "Connection": "keep-alive",
+    }
+
+async def stealth_worker(
+    queue: asyncio.Queue,
+    session,
+    url: str,
+    pbar,
+    module: str
+) -> None:
+    """
+    Worker for segmented downloads.
+    Args:
+        queue: Queue of download tasks (start, end, part_path, attempt).
+        session: aiohttp ClientSession.
+        url: URL of the file.
+        pbar: Progress bar.
+        module: Name of the module (for logging).
+    """
     while True:
         try:
             start, end, part_path, attempt = queue.get_nowait()
@@ -212,19 +412,23 @@ async def stealth_worker(queue: asyncio.Queue, session: aiohttp.ClientSession, u
             break
 
         expected_size = end - start + 1
+
+        # Skip if part already exists and is complete
         if part_path.exists() and part_path.stat().st_size == expected_size:
             pbar.update(expected_size)
             queue.task_done()
             continue
 
-        await asyncio.sleep(random.uniform(0.5, 1.5))
-        
+        # Random delay to avoid detection
+        delay = min(2 ** attempt, 10)  # Exponential backoff, max 10s
+        await asyncio.sleep(delay + random.uniform(0.1, 0.5))
+
         headers = get_random_headers(url, start, end)
         success = False
-        
+
         try:
             timeout = aiohttp.ClientTimeout(total=60, sock_read=30)
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
+            async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as resp:
                 if resp.status in (200, 206):
                     data = await resp.read()
                     if len(data) == expected_size:
@@ -232,209 +436,397 @@ async def stealth_worker(queue: asyncio.Queue, session: aiohttp.ClientSession, u
                             await f.write(data)
                         pbar.update(expected_size)
                         success = True
-                elif resp.status in (403, 429):
-                    await asyncio.sleep(5)
-        except Exception:
-            pass
+                elif resp.status == 429:  # Too Many Requests
+                    retry_after = int(resp.headers.get("Retry-After", 5))
+                    await asyncio.sleep(retry_after)
+                elif resp.status in (403, 404):
+                    LOGGER.error(f"{module}: HTTP {resp.status} for {url} (segment {start}-{end})")
+                else:
+                    LOGGER.error(f"{module}: Unexpected status {resp.status} for {url}")
+        except asyncio.TimeoutError:
+            LOGGER.warning(f"{module}: Timeout for segment {start}-{end} (attempt {attempt})")
+        except aiohttp.ClientError as e:
+            LOGGER.error(f"{module}: aiohttp error for {url}: {e}")
+        except Exception as e:
+            LOGGER.error(f"{module}: Unexpected error: {e}")
 
         if not success:
-            if attempt < 15:
+            if attempt < RETRY_ATTEMPTS:
                 queue.put_nowait((start, end, part_path, attempt + 1))
             else:
-                LOGGER.error(f"Abandon du segment {start}-{end}")
+                LOGGER.error(f"{module}: Giving up on segment {start}-{end} after {RETRY_ATTEMPTS} attempts")
 
         queue.task_done()
 
-async def download_file_stealth(media: Dict) -> bool:
+async def download_file(media: Dict) -> bool:
+    """
+    Download a file using segmented downloads.
+    Args:
+        media: Dictionary with media info (url, filename, target_path, module, etc.).
+    Returns:
+        True if download succeeded, False otherwise.
+    """
     media_id = media["media_id"]
     url = media["media_url"]
     filename = media["filename"]
     output_path = Path(media["target_path"])
-    
+    module = media["module"]
+
     await update_media_status(media_id, "DOWNLOADING")
-    
-    connector = aiohttp.TCPConnector(limit=0)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        total_size = await get_file_size(url, session)
-        
-        if total_size == 0:
-            await update_media_status(media_id, "FAILED")
-            return False
 
-        CHUNK_SIZE = 10 * 1024 * 1024 
-        WORKERS_COUNT = 3             
+    # Configure aiohttp with connection limits
+    connector = aiohttp.TCPConnector(
+        limit=10,               # Max 10 total connections
+        limit_per_host=3,      # Max 3 connections per host
+        force_close=True,      # Close connections after use
+        enable_cleanup_closed=True
+    )
 
-        queue = asyncio.Queue()
-        num_chunks = 0
-        
-        for start in range(0, total_size, CHUNK_SIZE):
-            end = min(start + CHUNK_SIZE - 1, total_size - 1)
-            part_path = Path(f"{output_path}.part{num_chunks}")
-            queue.put_nowait((start, end, part_path, 0))
-            num_chunks += 1
+    try:
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+        ) as session:
+            # Get file size
+            total_size = await get_file_size(url, session)
+            if total_size == 0:
+                LOGGER.error(f"{module}: Failed to get file size for {url}")
+                await update_media_status(media_id, "FAILED")
+                return False
 
-        short_name = filename[:30] + ".." if len(filename) > 32 else filename.ljust(32)
-        pbar = tqdm(total=total_size, unit="o", unit_scale=True, unit_divisor=1024, desc=f"🚀 {short_name}", leave=True)
+            # Dynamic chunk size based on file size
+            if total_size < 50 * 1024 * 1024:  # < 50 MB
+                chunk_size = max(MIN_CHUNK_SIZE, total_size // 3)  # At least 3 chunks
+            else:
+                chunk_size = CHUNK_SIZE
 
-        tasks = [asyncio.create_task(stealth_worker(queue, session, url, pbar)) for _ in range(WORKERS_COUNT)]
-        await queue.join()
-        for task in tasks:
-            task.cancel()
-        pbar.close()
+            num_chunks = (total_size + chunk_size - 1) // chunk_size
+            workers_count = min(MAX_WORKERS, num_chunks)
 
-    missing_parts = any(not Path(f"{output_path}.part{i}").exists() for i in range(num_chunks))
-
-    if not missing_parts:
-        tqdm.write(f"{Colors.CYAN}⏳ Assemblage NVMe en cours...{Colors.RESET}")
-        async with aiofiles.open(output_path, "wb") as outfile:
+            # Create queue and add chunks
+            queue = asyncio.Queue()
             for i in range(num_chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size - 1, total_size - 1)
                 part_path = Path(f"{output_path}.part{i}")
-                async with aiofiles.open(part_path, "rb") as infile:
-                    await outfile.write(await infile.read())
-                part_path.unlink()
-        
-        is_valid = await verify_video_integrity(output_path)
-        if not is_valid:
-            tqdm.write(f"{Colors.RED}❌ Fichier illisible détecté : {filename}. Suppression.{Colors.RESET}")
-            output_path.unlink()
-            await update_media_status(media_id, "FAILED")
-            return False
-            
-        tqdm.write(f"{Colors.GREEN}✅ Terminé : {filename}{Colors.RESET}")
-        await update_media_status(media_id, "COMPLETED")
-        return True
-    else:
-        tqdm.write(f"{Colors.RED}❌ Échec de l'assemblage : {filename}{Colors.RESET}")
+                queue.put_nowait((start, end, part_path, 0))
+
+            # Progress bar
+            short_name = filename[:30] + ".." if len(filename) > 32 else filename.ljust(32)
+            pbar = tqdm(
+                total=total_size,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=f"🚀 {short_name} ({module})",
+                leave=True
+            )
+
+            # Start workers
+            tasks = [
+                asyncio.create_task(stealth_worker(queue, session, url, pbar, module))
+                for _ in range(workers_count)
+            ]
+
+            # Wait for all chunks to complete
+            await queue.join()
+
+            # Cancel workers
+            for task in tasks:
+                task.cancel()
+
+            pbar.close()
+
+            # Check if all parts are downloaded
+            missing_parts = any(
+                not Path(f"{output_path}.part{i}").exists()
+                for i in range(num_chunks)
+            )
+
+            if not missing_parts:
+                # Assemble parts
+                tqdm.write(f"{Colors.CYAN}📦 Assembling {filename}...{Colors.RESET}")
+                async with aiofiles.open(output_path, "wb") as outfile:
+                    for i in range(num_chunks):
+                        part_path = Path(f"{output_path}.part{i}")
+                        async with aiofiles.open(part_path, "rb") as infile:
+                            await outfile.write(await infile.read())
+                        part_path.unlink()  # Delete part after assembly
+
+                # Verify integrity
+                is_valid = await verify_media_integrity(output_path)
+                if not is_valid:
+                    tqdm.write(f"{Colors.RED}❌ Corrupted file: {filename}. Deleting.{Colors.RESET}")
+                    output_path.unlink()
+                    await update_media_status(media_id, "FAILED")
+                    return False
+
+                tqdm.write(f"{Colors.GREEN}✅ Downloaded: {filename}{Colors.RESET}")
+                await update_media_status(media_id, "COMPLETED")
+                return True
+            else:
+                tqdm.write(f"{Colors.RED}❌ Failed to assemble: {filename}{Colors.RESET}")
+                await update_media_status(media_id, "FAILED")
+                return False
+
+    except Exception as e:
+        LOGGER.error(f"{module}: Download failed for {filename}: {e}")
         await update_media_status(media_id, "FAILED")
         return False
 
-# ====================== EXTRACTION AMÉLIORÉE (AVEC SPINNER) ======================
+async def verify_media_integrity(file_path: Path) -> bool:
+    """
+    Verify the integrity of a downloaded media file.
+    Args:
+        file_path: Path to the file.
+    Returns:
+        True if file is valid, False otherwise.
+    """
+    if not file_path.exists() or file_path.stat().st_size == 0:
+        return False
 
-async def register_medias_in_db(album_url: str, target_dir: Path, raw_urls: List[str]) -> List[Dict]:
-    medias = []
-    async with aiosqlite.connect(DB_FILE) as db:
-        for src in set(raw_urls):
-            if not src or not src.startswith("http"): continue
-            m_type = classify_media(src)
-            ext = Path(urlparse(src).path).suffix.lower() or (".mp4" if m_type == "video" else ".png")
-            media_id = generate_hash(src)
-            filename = f"media_{m_type}_{media_id}{ext}"
-            target_path = str(target_dir / filename)
+    ext = file_path.suffix.lower()
 
-            cursor = await db.execute("SELECT status FROM medias WHERE media_id = ?", (media_id,))
-            row = await cursor.fetchone()
-            media_dict = {"media_id": media_id, "album_url": album_url, "media_url": src, "filename": filename, "type": m_type, "status": "PENDING", "target_path": target_path}
+    # Check video files with ffprobe
+    if ext in VIDEO_EXTS:
+        try:
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=nw=1:nk=1",
+                str(file_path)
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            return "video" in stdout.decode().strip().lower()
+        except Exception as e:
+            LOGGER.error(f"ffprobe failed for {file_path}: {e}")
+            return True  # Assume valid if ffprobe fails
 
-            if row and row[0] == "COMPLETED" and Path(target_path).exists():
-                continue 
-            else:
-                if not row:
-                    await db.execute("INSERT INTO medias (media_id, album_url, media_url, filename, media_type, status, target_path) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                                     (media_id, album_url, src, filename, m_type, "PENDING", target_path))
-                medias.append(media_dict)
-        await db.commit()
-    return medias
+    # Check image files with Pillow
+    elif ext in IMAGE_EXTS:
+        try:
+            from PIL import Image
+            with Image.open(file_path) as img:
+                img.verify()  # Verify integrity
+            return True
+        except Exception as e:
+            LOGGER.error(f"Pillow verification failed for {file_path}: {e}")
+            return False
 
-async def show_spinner(message: str):
-    """Animation visuelle pour prouver que l'extraction tourne."""
-    chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-    i = 0
-    try:
-        while True:
-            sys.stdout.write(f"\r{Colors.YELLOW}{message} {chars[i % len(chars)]}{Colors.RESET}")
-            sys.stdout.flush()
-            await asyncio.sleep(0.1)
-            i += 1
-    except asyncio.CancelledError:
-        sys.stdout.write("\r" + " " * 80 + "\r")
-        sys.stdout.flush()
+    # For other files, just check size > 0
+    return file_path.stat().st_size > 0
 
-async def scrape_gallery_dl(url: str, platform: str) -> List[Dict]:
-    if platform == "bunkr" and not url.startswith("http"): 
-        url = f"https://bunkr.cr/a/{url}"
-        
-    print(f"\n{Colors.CYAN}🔍 Démarrage de l'extraction pour {platform}...{Colors.RESET}")
-    
-    spinner_task = asyncio.create_task(show_spinner("Analyse approfondie (Contournement Cloudflare en cours)"))
-    
-    cmd = [
-        "gallery-dl", 
-        "-g", 
-        "--user-agent", random.choice(USER_AGENTS),
-        url
-    ]
-    
-    try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
-    except asyncio.TimeoutError:
-        spinner_task.cancel()
-        print(f"{Colors.RED}❌ L'extraction a pris trop de temps (Timeout Cloudflare). Bunkr restreint ton accès temporairement.{Colors.RESET}")
-        return []
-    finally:
-        spinner_task.cancel()
-        await asyncio.sleep(0.1)
-    
-    if proc.returncode != 0:
-        print(f"{Colors.RED}❌ Erreur d'extraction. Profil/Album introuvable ou protégé agressivement.{Colors.RESET}")
-        return []
+# ====================== MODULE LOADING ======================
+def load_module(module_name: str):
+    """
+    Dynamically load a module.
+    Args:
+        module_name: Name of the module (e.g., "bunkr").
+    Returns:
+        The module object, or None if failed.
+    """
+    if module_name not in MODULES:
+        return None
 
-    target_dir = DOWNLOADS_DIR / platform
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return await register_medias_in_db(url, target_dir, stdout.decode().strip().split('\n'))
+    if MODULES[module_name] is None:
+        try:
+            module = __import__(f"Modules.{module_name}", fromlist=[module_name])
+            MODULES[module_name] = module
+            return module
+        except ImportError as e:
+            LOGGER.error(f"Failed to load module {module_name}: {e}")
+            return None
 
-async def process_downloads(medias: List[Dict]):
-    if not medias:
-        print(f"\n{Colors.GREEN}✔ Tous les fichiers sont déjà téléchargés.{Colors.RESET}")
+    return MODULES[module_name]
+
+async def get_available_modules() -> List[Tuple[str, str]]:
+    """
+    Get list of available modules with their descriptions.
+    Returns:
+        List of tuples (module_name, description).
+    """
+    modules = []
+    for module_name in MODULES:
+        module = load_module(module_name)
+        if module:
+            description = getattr(module, "DESCRIPTION", "No description")
+            modules.append((module_name, description))
+    return modules
+
+# ====================== CLI MENU ======================
+async def process_module_downloads(module_name: str, url: str) -> None:
+    """
+    Process downloads for a given module.
+    Args:
+        module_name: Name of the module (e.g., "bunkr").
+        url: URL to scrape.
+    """
+    module = load_module(module_name)
+    if not module:
+        print(f"{Colors.RED}❌ Module {module_name} not found or failed to load.{Colors.RESET}")
         return
 
-    videos = sum(1 for m in medias if m["type"] == "video")
-    images = sum(1 for m in medias if m["type"] == "image")
+    try:
+        # Call the module's scrape function
+        medias = await module.scrape(url)
+        if not medias:
+            print(f"{Colors.RED}❌ No media found for {url}.{Colors.RESET}")
+            return
 
-    print("\n" + "=" * 55)
-    print(f"{Colors.BOLD}{Colors.GREEN}📊 MÉDIAS EN ATTENTE{Colors.RESET}")
-    print("=" * 55)
-    print(f"🎬 Vidéos  : {Colors.BOLD}{videos}{Colors.RESET}")
-    print(f"🖼️ Images  : {Colors.BOLD}{images}{Colors.RESET}")
-    print(f"📦 Total   : {Colors.BOLD}{len(medias)}{Colors.RESET}")
-    print("=" * 55)
-    
-    if input(f"\n{Colors.BOLD}Lancer le téléchargement ? (o/n) : {Colors.RESET}").strip().lower() in ["n", "no"]:
-        return
+        # Filter out already completed medias
+        new_medias = []
+        for media in medias:
+            if await register_media(media):
+                new_medias.append(media)
 
-    clean_console()
-    print(f"{Colors.GREEN}🚀 Lancement du téléchargement (Cruise Control)...{Colors.RESET}\n")
-    
-    for i, media in enumerate(medias, start=1):
-        print(f"\n{Colors.CYAN}Fichier {i}/{len(medias)}{Colors.RESET}")
-        await download_file_stealth(media)
+        if not new_medias:
+            print(f"{Colors.GREEN}✅ All media already downloaded.{Colors.RESET}")
+            return
 
-# ====================== MENU CLI ======================
+        # Display found media
+        videos = sum(1 for m in new_medias if m["type"] == "video")
+        images = sum(1 for m in new_medias if m["type"] == "image")
+        print("\n" + "=" * 55)
+        print(f"{Colors.BOLD}{Colors.GREEN}📁 MEDIA TO DOWNLOAD ({module_name.upper()}){Colors.RESET}")
+        print("=" * 55)
+        print(f"🎬 Videos  : {Colors.BOLD}{videos}{Colors.RESET}")
+        print(f"🖼️  Images  : {Colors.BOLD}{images}{Colors.RESET}")
+        print(f"📦 Total   : {Colors.BOLD}{len(new_medias)}{Colors.RESET}")
+        print("=" * 55)
 
-async def main_loop():
+        # Ask for confirmation
+        if input(f"\n{Colors.BOLD}Start download? (y/n): {Colors.RESET}").strip().lower() not in ["y", "yes"]:
+            return
+
+        clean_console()
+        print(f"{Colors.GREEN}🚀 Starting download ({module_name})...{Colors.RESET}\n")
+
+        # Download each media
+        for i, media in enumerate(new_medias, start=1):
+            print(f"\n{Colors.CYAN}File {i}/{len(new_medias)} ({module_name}){Colors.RESET}")
+            await download_file(media)
+
+    except Exception as e:
+        LOGGER.error(f"Error in module {module_name}: {e}")
+        print(f"{Colors.RED}❌ Error: {e}{Colors.RESET}")
+
+async def show_stats() -> None:
+    """
+    Display download statistics from the database.
+    """
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            # Total media
+            cursor = await db.execute("SELECT COUNT(*) FROM medias")
+            total = (await cursor.fetchone())[0]
+
+            # Completed
+            cursor = await db.execute("SELECT COUNT(*) FROM medias WHERE status = 'COMPLETED'")
+            completed = (await cursor.fetchone())[0]
+
+            # Failed
+            cursor = await db.execute("SELECT COUNT(*) FROM medias WHERE status = 'FAILED'")
+            failed = (await cursor.fetchone())[0]
+
+            # By module
+            cursor = await db.execute("""
+                SELECT module, COUNT(*)
+                FROM medias
+                WHERE status = 'COMPLETED'
+                GROUP BY module
+            """)
+            rows = await cursor.fetchall()
+            module_stats = {row[0]: row[1] for row in rows}
+
+            print("\n" + "=" * 55)
+            print(f"{Colors.BOLD}📊 STATISTICS{Colors.RESET}")
+            print("=" * 55)
+            print(f"✅ Completed: {Colors.BOLD}{completed}{Colors.RESET}")
+            print(f"❌ Failed   : {Colors.BOLD}{failed}{Colors.RESET}")
+            print(f"📦 Total    : {Colors.BOLD}{total}{Colors.RESET}")
+
+            if module_stats:
+                print("\n📁 By Module:")
+                for module, count in module_stats.items():
+                    print(f"   - {module.upper()}: {count}")
+
+            print("=" * 55)
+    except Exception as e:
+        LOGGER.error(f"Failed to show stats: {e}")
+        print(f"{Colors.RED}❌ Error loading stats: {e}{Colors.RESET}")
+
+async def main_loop() -> None:
+    """
+    Main CLI loop.
+    Displays menu, handles user input, and processes downloads.
+    """
     await init_database()
+    await setup_environment()
+
+    # Pre-load modules
+    for module_name in MODULES:
+        load_module(module_name)
+
     while True:
+        clean_console()
         print("\n" + "=" * 65)
-        print(f"{Colors.BOLD}{Colors.RED}🔥 STEALTH-SCRAPER (CRUISE CONTROL) 🔥{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.RED}🔥 NSFW-SCRAPER (MODULAR) 🔥{Colors.RESET}")
         print("=" * 65)
-        print("1. Sites Streaming -> [Natif yt-dlp]")
-        print("2. Bunkr / Albums  -> [Moteur Furtif Constant]")
-        print("3. Quitter")
+
+        # Display available modules
+        modules = await get_available_modules()
+        for i, (module_name, description) in enumerate(modules, start=1):
+            print(f"{i}. {module_name.upper()} - {description}")
+
+        print(f"{len(modules) + 1}. Statistics")
+        print(f"{len(modules) + 2}. Exit")
         print("=" * 65)
-        
-        choice = input("Choisissez une option : ").strip()
-        if choice == "3": break
-        if choice not in ["1", "2"]: continue
-            
-        url = input(f"\n{Colors.BOLD}URL exacte : {Colors.RESET}").strip()
-        if choice == "1":
-            await download_ytdlp_native(url, "streaming")
-        elif choice == "2":
-            medias = await scrape_gallery_dl(url, "bunkr")
-            await process_downloads(medias)
+
+        try:
+            choice = input("Select an option: ").strip()
+            if choice == str(len(modules) + 2):  # Exit
+                break
+            elif choice == str(len(modules) + 1):  # Stats
+                await show_stats()
+                input("\nPress Enter to continue...")
+                continue
+
+            choice_index = int(choice) - 1
+            if 0 <= choice_index < len(modules):
+                module_name, _ = modules[choice_index]
+                url = input(f"\n{Colors.BOLD}URL for {module_name.upper()}: {Colors.RESET}").strip()
+                await process_module_downloads(module_name, url)
+            else:
+                print(f"{Colors.RED}❌ Invalid choice.{Colors.RESET}")
+
+        except ValueError:
+            print(f"{Colors.RED}❌ Please enter a number.{Colors.RESET}")
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}👋 Exiting...{Colors.RESET}")
+            break
+
+        input("\nPress Enter to continue...")
 
 if __name__ == "__main__":
     try:
+        # Import aiohttp and others (after setup_environment)
+        import aiohttp
+        import aiofiles
+        import aiosqlite
+        from tqdm.asyncio import tqdm
+
         asyncio.run(main_loop())
     except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}👋 Goodbye!{Colors.RESET}")
         sys.exit(0)
+    except Exception as e:
+        LOGGER.critical(f"Fatal error: {e}", exc_info=True)
+        print(f"{Colors.RED}❌ Fatal error: {e}{Colors.RESET}")
+        sys.exit(1)

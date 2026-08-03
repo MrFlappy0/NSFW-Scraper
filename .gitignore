@@ -1,0 +1,20 @@
+# Directories
+scrap/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Files
+*.log
+*.sqlite
+*.part*
+.env
+setup_cache.json
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

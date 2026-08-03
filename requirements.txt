@@ -1,7 +1,8 @@
-aiohttp>=3.8.0
-aiofiles>=23.0.0
+# Core dependencies
+aiohttp>=3.9.0
+aiofiles>=23.2.0
 aiosqlite>=0.19.0
-yt-dlp>=2024.0.1
-gallery-dl>=1.25.0
-tqdm>=4.66.0
-Pillow>=10.0.0
+yt-dlp>=2024.7.9
+gallery-dl>=1.25.7
+tqdm>=4.66.1
+Pillow>=10.1.0
